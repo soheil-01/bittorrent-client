@@ -1,4 +1,5 @@
 const std = @import("std");
+const cli = @import("zig-cli");
 
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 const allocator = gpa.allocator();
@@ -48,18 +49,18 @@ const BencodeValue = union(enum) {
         }
     }
 
-    fn deinit(self: *BencodeValue) void {
+    fn deinit(self: *BencodeValue, alloc: std.mem.Allocator) void {
         switch (self.*) {
-            .String => |str| allocator.free(str),
+            .String => |str| alloc.free(str),
             .List => |*list| {
-                for (list.items) |*item| item.deinit();
+                for (list.items) |*item| item.deinit(alloc);
                 list.deinit();
             },
             .Dict => |*dict| {
                 var iter = dict.iterator();
                 while (iter.next()) |entry| {
-                    allocator.free(entry.key_ptr.*);
-                    entry.value_ptr.deinit();
+                    alloc.free(entry.key_ptr.*);
+                    entry.value_ptr.deinit(alloc);
                 }
                 dict.deinit();
             },
@@ -68,85 +69,133 @@ const BencodeValue = union(enum) {
     }
 };
 
-fn getCurrentByte(reader: anytype) !u8 {
-    const pos = reader.context.pos;
-    const byte = try reader.readByte();
-    try reader.context.seekTo(pos);
+const BencodeDecoder = struct {
+    allocator: std.mem.Allocator,
 
-    return byte;
-}
-
-fn decodeString(reader: anytype) !BencodeValue {
-    const len_str = try reader.readUntilDelimiterAlloc(allocator, ':', std.math.maxInt(u32));
-    defer allocator.free(len_str);
-
-    const len = try std.fmt.parseInt(u32, len_str, 10);
-
-    const str = try allocator.alloc(u8, len);
-    try reader.readNoEof(str);
-
-    return .{ .String = str };
-}
-
-fn decodeInt(reader: anytype) !BencodeValue {
-    const int_str = try reader.readUntilDelimiterAlloc(allocator, 'e', std.math.maxInt(u32));
-    defer allocator.free(int_str);
-
-    const int = try std.fmt.parseInt(i64, int_str, 10);
-
-    return .{ .Int = int };
-}
-
-fn decodeList(reader: anytype) !BencodeValue {
-    var list = std.ArrayList(BencodeValue).init(allocator);
-
-    while (try getCurrentByte(reader) != 'e') {
-        const item = try decode(reader);
-        try list.append(item);
+    fn init(alloc: std.mem.Allocator) BencodeDecoder {
+        return .{ .allocator = alloc };
     }
-    try reader.skipBytes(1, .{});
 
-    return .{ .List = list };
-}
+    fn getCurrentByte(reader: anytype) !u8 {
+        const pos = reader.context.pos;
+        const byte = try reader.readByte();
+        try reader.context.seekTo(pos);
 
-fn decodeDict(reader: anytype) !BencodeValue {
-    var dict = std.StringHashMap(BencodeValue).init(allocator);
-
-    while (try getCurrentByte(reader) != 'e') {
-        const key = try decode(reader);
-        const value = try decode(reader);
-
-        try dict.put(key.String, value);
+        return byte;
     }
-    try reader.skipBytes(1, .{});
 
-    return .{ .Dict = dict };
-}
+    fn decodeString(self: BencodeDecoder, reader: anytype) !BencodeValue {
+        const len_str = try reader.readUntilDelimiterAlloc(self.allocator, ':', std.math.maxInt(u32));
+        defer self.allocator.free(len_str);
 
-fn decode(reader: anytype) anyerror!BencodeValue {
-    const byte = try reader.readByte();
-    switch (byte) {
-        '0'...'9' => {
-            try reader.context.seekBy(-1);
-            return decodeString(reader);
-        },
-        'i' => return decodeInt(reader),
-        'l' => return decodeList(reader),
-        'd' => return decodeDict(reader),
-        else => return error.InvalidBencode,
+        const len = try std.fmt.parseInt(u32, len_str, 10);
+
+        const str = try self.allocator.alloc(u8, len);
+        try reader.readNoEof(str);
+
+        return .{ .String = str };
     }
-}
+
+    fn decodeInt(self: BencodeDecoder, reader: anytype) !BencodeValue {
+        const int_str = try reader.readUntilDelimiterAlloc(self.allocator, 'e', std.math.maxInt(u32));
+        defer self.allocator.free(int_str);
+
+        const int = try std.fmt.parseInt(i64, int_str, 10);
+
+        return .{ .Int = int };
+    }
+
+    fn decodeList(self: BencodeDecoder, reader: anytype) !BencodeValue {
+        var list = std.ArrayList(BencodeValue).init(self.allocator);
+
+        while (try getCurrentByte(reader) != 'e') {
+            const item = try self.decode(reader);
+            try list.append(item);
+        }
+        try reader.skipBytes(1, .{});
+
+        return .{ .List = list };
+    }
+
+    fn decodeDict(self: BencodeDecoder, reader: anytype) !BencodeValue {
+        var dict = std.StringHashMap(BencodeValue).init(self.allocator);
+
+        while (try getCurrentByte(reader) != 'e') {
+            const key = try self.decode(reader);
+            const value = try self.decode(reader);
+
+            try dict.put(key.String, value);
+        }
+        try reader.skipBytes(1, .{});
+
+        return .{ .Dict = dict };
+    }
+
+    fn decode(self: BencodeDecoder, reader: anytype) anyerror!BencodeValue {
+        const byte = try reader.readByte();
+        switch (byte) {
+            '0'...'9' => {
+                try reader.context.seekBy(-1);
+                return self.decodeString(reader);
+            },
+            'i' => return self.decodeInt(reader),
+            'l' => return self.decodeList(reader),
+            'd' => return self.decodeDict(reader),
+            else => return error.InvalidBencode,
+        }
+    }
+};
+
+var config = struct {
+    arg1: []const u8 = undefined,
+}{};
 
 pub fn main() !void {
     defer _ = gpa.deinit();
 
+    var r = try cli.AppRunner.init(allocator);
+
+    const app = cli.App{
+        .command = cli.Command{
+            .name = "bittorrent-client",
+            .target = cli.CommandTarget{
+                .subcommands = &.{
+                    cli.Command{
+                        .name = "decode",
+                        .target = cli.CommandTarget{
+                            .action = cli.CommandAction{
+                                .exec = decodeBencode,
+                                .positional_args = cli.PositionalArgs{
+                                    .required = try r.mkSlice(
+                                        cli.PositionalArg,
+                                        &.{
+                                            .{
+                                                .name = "bencode-string",
+                                                .value_ref = r.mkRef(&config.arg1),
+                                            },
+                                        },
+                                    ),
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    };
+
+    return r.run(&app);
+}
+
+fn decodeBencode() !void {
     const writer = std.io.getStdOut().writer();
 
-    var fb = std.io.fixedBufferStream("d3:foo3:bar5:helloi52ee");
+    var fb = std.io.fixedBufferStream(config.arg1);
     const reader = fb.reader();
 
-    var result = try decode(reader);
-    defer result.deinit();
+    var decoder = BencodeDecoder.init(allocator);
+    var result = try decoder.decode(reader);
+    defer result.deinit(allocator);
 
     try result.write(writer);
     try writer.writeByte('\n');
