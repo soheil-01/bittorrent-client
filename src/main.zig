@@ -1,6 +1,8 @@
 const std = @import("std");
 const cli = @import("zig-cli");
 
+const Sha1 = std.crypto.hash.Sha1;
+
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 const allocator = gpa.allocator();
 
@@ -65,6 +67,49 @@ const BencodeValue = union(enum) {
                 dict.deinit();
             },
             else => {},
+        }
+    }
+
+    fn encode(self: BencodeValue, alloc: std.mem.Allocator) ![]u8 {
+        switch (self) {
+            .String => |str| return std.fmt.allocPrint(alloc, "{d}:{s}", .{ str.len, str }),
+            .Int => |int| return std.fmt.allocPrint(alloc, "i{d}e", .{int}),
+            .List => |list| {
+                var bencoded = std.ArrayList(u8).init(alloc);
+
+                try bencoded.append('l');
+                for (list.items) |item| {
+                    const item_bencoded = try item.encode(alloc);
+                    defer alloc.free(item_bencoded);
+
+                    try bencoded.appendSlice(item_bencoded);
+                }
+                try bencoded.append('e');
+
+                return bencoded.toOwnedSlice();
+            },
+            .Dict => |dict| {
+                var bencoded = std.ArrayList(u8).init(alloc);
+
+                try bencoded.append('d');
+                var iter = dict.iterator();
+                while (iter.next()) |entry| {
+                    const key = BencodeValue{ .String = entry.key_ptr.* };
+
+                    const key_bencoded = try key.encode(alloc);
+                    defer allocator.free(key_bencoded);
+                    try bencoded.appendSlice(key_bencoded);
+
+                    const value = entry.value_ptr.*;
+
+                    const value_bencoded = try value.encode(alloc);
+                    defer allocator.free(value_bencoded);
+                    try bencoded.appendSlice(value_bencoded);
+                }
+                try bencoded.append('e');
+
+                return bencoded.toOwnedSlice();
+            },
         }
     }
 };
@@ -240,8 +285,17 @@ fn printInfo() !void {
 
     if (info != .Dict) return error.InvalidTorrentFile;
 
-    const length = info.Dict.get("length") orelse return error.InvalidTorrentFile;
+    const info_bencoded = try info.encode(allocator);
+    defer allocator.free(info_bencoded);
+
+    var info_hash: [Sha1.digest_length]u8 = undefined;
+    Sha1.hash(info_bencoded, &info_hash, .{});
+
+    const length = info.Dict.get("piece length") orelse return error.InvalidTorrentFile;
 
     try writer.print("Tracker URL: {s}\n", .{announce.String});
     try writer.print("Length: {d}\n", .{length.Int});
+    try writer.writeAll("Info Hash: ");
+    for (info_hash) |byte| try writer.print("{x:0>2}", .{byte});
+    try writer.writeByte('\n');
 }
