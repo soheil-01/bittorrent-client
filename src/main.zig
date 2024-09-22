@@ -179,6 +179,25 @@ pub fn main() !void {
                             },
                         },
                     },
+                    cli.Command{
+                        .name = "info",
+                        .target = cli.CommandTarget{
+                            .action = cli.CommandAction{
+                                .exec = printInfo,
+                                .positional_args = cli.PositionalArgs{
+                                    .required = try r.mkSlice(
+                                        cli.PositionalArg,
+                                        &.{
+                                            .{
+                                                .name = "torrent-file",
+                                                .value_ref = r.mkRef(&config.arg1),
+                                            },
+                                        },
+                                    ),
+                                },
+                            },
+                        },
+                    },
                 },
             },
         },
@@ -199,4 +218,30 @@ fn decodeBencode() !void {
 
     try result.write(writer);
     try writer.writeByte('\n');
+}
+
+fn printInfo() !void {
+    const writer = std.io.getStdOut().writer();
+
+    const torrent_file = try std.fs.cwd().readFileAlloc(allocator, config.arg1, std.math.maxInt(usize));
+    defer allocator.free(torrent_file);
+
+    var fb = std.io.fixedBufferStream(torrent_file);
+    const reader = fb.reader();
+
+    var decoder = BencodeDecoder.init(allocator);
+    var result = try decoder.decode(reader);
+    defer result.deinit(allocator);
+
+    if (result != .Dict) return error.InvalidTorrentFile;
+
+    const announce = result.Dict.get("announce") orelse return error.InvalidTorrentFile;
+    const info = result.Dict.get("info") orelse return error.InvalidTorrentFile;
+
+    if (info != .Dict) return error.InvalidTorrentFile;
+
+    const length = info.Dict.get("length") orelse return error.InvalidTorrentFile;
+
+    try writer.print("Tracker URL: {s}\n", .{announce.String});
+    try writer.print("Length: {d}\n", .{length.Int});
 }
