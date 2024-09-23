@@ -291,11 +291,18 @@ fn printInfo() !void {
     var info_hash: [Sha1.digest_length]u8 = undefined;
     Sha1.hash(info_bencoded, &info_hash, .{});
 
-    const length = info.Dict.get("piece length") orelse return error.InvalidTorrentFile;
+    const length = info.Dict.get("length") orelse return error.InvalidTorrentFile;
+    const piece_length = info.Dict.get("piece length") orelse return error.InvalidTorrentFile;
+
+    const pieces = info.Dict.get("pieces") orelse return error.InvalidTorrentFile;
+
+    var pieces_iter = std.mem.window(u8, pieces.String, 20, 20);
 
     try writer.print("Tracker URL: {s}\n", .{announce.String});
     try writer.print("Length: {d}\n", .{length.Int});
-    try writer.writeAll("Info Hash: ");
-    for (info_hash) |byte| try writer.print("{x:0>2}", .{byte});
-    try writer.writeByte('\n');
+    try writer.print("Info Hash: {s}\n", .{std.fmt.fmtSliceHexLower(&info_hash)});
+    try writer.print("Piece Length: {d}\n", .{piece_length.Int});
+
+    try writer.writeAll("Piece Hashes:\n");
+    while (pieces_iter.next()) |piece| std.debug.print("{s}\n", .{std.fmt.fmtSliceHexLower(piece)});
 }
