@@ -191,6 +191,61 @@ const BencodeDecoder = struct {
     }
 };
 
+const TorrentInfo = struct {
+    announce: []const u8,
+    info_hash: [Sha1.digest_length]u8,
+    length: i64,
+    piece_length: i64,
+    pieces: [][]const u8,
+
+    fn deinit(self: TorrentInfo, alloc: std.mem.Allocator) void {
+        alloc.free(self.announce);
+        for (self.pieces) |piece| alloc.free(piece);
+        alloc.free(self.pieces);
+    }
+};
+
+fn parseTorrentFile(alloc: std.mem.Allocator, file_path: []const u8) !TorrentInfo {
+    const torrent_file = try std.fs.cwd().readFileAlloc(alloc, file_path, std.math.maxInt(usize));
+    defer alloc.free(torrent_file);
+
+    var fb = std.io.fixedBufferStream(torrent_file);
+    const reader = fb.reader();
+
+    var decoder = BencodeDecoder.init(alloc);
+    var result = try decoder.decode(reader);
+    defer result.deinit(alloc);
+
+    if (result != .Dict) return error.InvalidTorrentFile;
+
+    const announce = result.Dict.get("announce") orelse return error.InvalidTorrentFile;
+    const info = result.Dict.get("info") orelse return error.InvalidTorrentFile;
+
+    if (info != .Dict) return error.InvalidTorrentFile;
+
+    const info_bencoded = try info.encode(allocator);
+    defer allocator.free(info_bencoded);
+
+    var info_hash: [Sha1.digest_length]u8 = undefined;
+    Sha1.hash(info_bencoded, &info_hash, .{});
+
+    const length = info.Dict.get("length") orelse return error.InvalidTorrentFile;
+    const piece_length = info.Dict.get("piece length") orelse return error.InvalidTorrentFile;
+
+    var pieces_arr = std.ArrayList([]const u8).init(alloc);
+    const pieces = info.Dict.get("pieces") orelse return error.InvalidTorrentFile;
+    var pieces_iter = std.mem.window(u8, pieces.String, 20, 20);
+    while (pieces_iter.next()) |piece| try pieces_arr.append(try alloc.dupe(u8, piece));
+
+    return .{
+        .announce = try alloc.dupe(u8, announce.String),
+        .info_hash = info_hash,
+        .length = length.Int,
+        .piece_length = piece_length.Int,
+        .pieces = try pieces_arr.toOwnedSlice(),
+    };
+}
+
 var config = struct {
     arg1: []const u8 = undefined,
 }{};
@@ -243,6 +298,25 @@ pub fn main() !void {
                             },
                         },
                     },
+                    cli.Command{
+                        .name = "peers",
+                        .target = cli.CommandTarget{
+                            .action = cli.CommandAction{
+                                .exec = printPeers,
+                                .positional_args = cli.PositionalArgs{
+                                    .required = try r.mkSlice(
+                                        cli.PositionalArg,
+                                        &.{
+                                            .{
+                                                .name = "torrent-file",
+                                                .value_ref = r.mkRef(&config.arg1),
+                                            },
+                                        },
+                                    ),
+                                },
+                            },
+                        },
+                    },
                 },
             },
         },
@@ -268,41 +342,16 @@ fn decodeBencode() !void {
 fn printInfo() !void {
     const writer = std.io.getStdOut().writer();
 
-    const torrent_file = try std.fs.cwd().readFileAlloc(allocator, config.arg1, std.math.maxInt(usize));
-    defer allocator.free(torrent_file);
+    const torrent_info = try parseTorrentFile(allocator, config.arg1);
+    defer torrent_info.deinit(allocator);
 
-    var fb = std.io.fixedBufferStream(torrent_file);
-    const reader = fb.reader();
-
-    var decoder = BencodeDecoder.init(allocator);
-    var result = try decoder.decode(reader);
-    defer result.deinit(allocator);
-
-    if (result != .Dict) return error.InvalidTorrentFile;
-
-    const announce = result.Dict.get("announce") orelse return error.InvalidTorrentFile;
-    const info = result.Dict.get("info") orelse return error.InvalidTorrentFile;
-
-    if (info != .Dict) return error.InvalidTorrentFile;
-
-    const info_bencoded = try info.encode(allocator);
-    defer allocator.free(info_bencoded);
-
-    var info_hash: [Sha1.digest_length]u8 = undefined;
-    Sha1.hash(info_bencoded, &info_hash, .{});
-
-    const length = info.Dict.get("length") orelse return error.InvalidTorrentFile;
-    const piece_length = info.Dict.get("piece length") orelse return error.InvalidTorrentFile;
-
-    const pieces = info.Dict.get("pieces") orelse return error.InvalidTorrentFile;
-
-    var pieces_iter = std.mem.window(u8, pieces.String, 20, 20);
-
-    try writer.print("Tracker URL: {s}\n", .{announce.String});
-    try writer.print("Length: {d}\n", .{length.Int});
-    try writer.print("Info Hash: {s}\n", .{std.fmt.fmtSliceHexLower(&info_hash)});
-    try writer.print("Piece Length: {d}\n", .{piece_length.Int});
+    try writer.print("Tracker URL: {s}\n", .{torrent_info.announce});
+    try writer.print("Length: {d}\n", .{torrent_info.length});
+    try writer.print("Info Hash: {s}\n", .{std.fmt.fmtSliceHexLower(&torrent_info.info_hash)});
+    try writer.print("Piece Length: {d}\n", .{torrent_info.piece_length});
 
     try writer.writeAll("Piece Hashes:\n");
-    while (pieces_iter.next()) |piece| std.debug.print("{s}\n", .{std.fmt.fmtSliceHexLower(piece)});
+    for (torrent_info.pieces) |piece| std.debug.print("{s}\n", .{std.fmt.fmtSliceHexLower(piece)});
 }
+
+fn printPeers() !void {}
