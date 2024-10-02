@@ -10,7 +10,7 @@ const BencodeValue = union(enum) {
     String: []const u8,
     Int: i64,
     List: std.ArrayList(BencodeValue),
-    Dict: std.StringHashMap(BencodeValue),
+    Dict: std.StringArrayHashMap(BencodeValue),
 
     fn write(self: BencodeValue, writer: anytype) !void {
         switch (self) {
@@ -163,7 +163,7 @@ const BencodeDecoder = struct {
     }
 
     fn decodeDict(self: BencodeDecoder, reader: anytype) !BencodeValue {
-        var dict = std.StringHashMap(BencodeValue).init(self.allocator);
+        var dict = std.StringArrayHashMap(BencodeValue).init(self.allocator);
 
         while (try getCurrentByte(reader) != 'e') {
             const key = try self.decode(reader);
@@ -202,6 +202,14 @@ const TorrentInfo = struct {
         alloc.free(self.announce);
         for (self.pieces) |piece| alloc.free(piece);
         alloc.free(self.pieces);
+    }
+};
+
+const Peer = struct {
+    ip: [4]u8,
+    port: u16,
+    fn write(self: Peer, writer: anytype) !void {
+        try writer.print("{d}.{d}.{d}.{d}:{d}", .{ self.ip[0], self.ip[1], self.ip[2], self.ip[3], self.port });
     }
 };
 
@@ -244,6 +252,37 @@ fn parseTorrentFile(alloc: std.mem.Allocator, file_path: []const u8) !TorrentInf
         .piece_length = piece_length.Int,
         .pieces = try pieces_arr.toOwnedSlice(),
     };
+}
+
+fn parsePeers(alloc: std.mem.Allocator, peers_string: []const u8) ![]Peer {
+    var peers = std.ArrayList(Peer).init(alloc);
+    errdefer peers.deinit();
+
+    var peers_iter = std.mem.window(u8, peers_string, 6, 6);
+    while (peers_iter.next()) |peer| {
+        var ip: [4]u8 = undefined;
+        @memcpy(&ip, peer[0..4]);
+        const port = std.mem.readInt(u16, peer[4..6], .big);
+
+        try peers.append(.{ .ip = ip, .port = port });
+    }
+
+    return peers.toOwnedSlice();
+}
+
+fn urlEncode(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
+    var output = std.ArrayList(u8).init(alloc);
+    errdefer output.deinit();
+
+    for (input) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') {
+            try output.append(c);
+        } else {
+            try std.fmt.format(output.writer(), "%{X:0>2}", .{c});
+        }
+    }
+
+    return output.toOwnedSlice();
 }
 
 var config = struct {
@@ -354,4 +393,64 @@ fn printInfo() !void {
     for (torrent_info.pieces) |piece| std.debug.print("{s}\n", .{std.fmt.fmtSliceHexLower(piece)});
 }
 
-fn printPeers() !void {}
+fn printPeers() !void {
+    const writer = std.io.getStdOut().writer();
+
+    const torrent_info = try parseTorrentFile(allocator, config.arg1);
+    defer torrent_info.deinit(allocator);
+
+    const info_hash_url_encoded = try urlEncode(allocator, &torrent_info.info_hash);
+    defer allocator.free(info_hash_url_encoded);
+
+    var peer_id: [20]u8 = undefined;
+    std.crypto.random.bytes(&peer_id);
+    const peer_id_url_encoded = try urlEncode(allocator, &peer_id);
+    defer allocator.free(peer_id_url_encoded);
+
+    const uri_text = try std.fmt.allocPrint(
+        allocator,
+        "{s}?info_hash={s}&peer_id={s}&port=6881&uploaded=0&downloaded=0&left={d}&compact=1",
+        .{
+            torrent_info.announce,
+            info_hash_url_encoded,
+            peer_id_url_encoded,
+            torrent_info.length,
+        },
+    );
+    defer allocator.free(uri_text);
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse(uri_text);
+    const buf = try allocator.alloc(u8, 1024 * 1024 * 4);
+    defer allocator.free(buf);
+
+    var req = try client.open(.GET, uri, .{
+        .server_header_buffer = buf,
+    });
+    defer req.deinit();
+
+    try req.send();
+    try req.finish();
+    try req.wait();
+
+    const body = try req.reader().readAllAlloc(allocator, std.math.maxInt(usize));
+    defer allocator.free(body);
+
+    var fb = std.io.fixedBufferStream(body);
+    const reader = fb.reader();
+
+    const decoder = BencodeDecoder.init(allocator);
+    var body_decoded = try decoder.decode(reader);
+    defer body_decoded.deinit(allocator);
+
+    const peers_string = body_decoded.Dict.get("peers").?.String;
+    const peers = try parsePeers(allocator, peers_string);
+    defer allocator.free(peers);
+
+    for (peers) |peer| {
+        try peer.write(writer);
+        try writer.writeByte('\n');
+    }
+}
