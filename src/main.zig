@@ -208,9 +208,6 @@ const TorrentInfo = struct {
 const Peer = struct {
     ip: [4]u8,
     port: u16,
-    fn write(self: Peer, writer: anytype) !void {
-        try writer.print("{d}.{d}.{d}.{d}:{d}", .{ self.ip[0], self.ip[1], self.ip[2], self.ip[3], self.port });
-    }
 };
 
 fn parseTorrentFile(alloc: std.mem.Allocator, file_path: []const u8) !TorrentInfo {
@@ -287,6 +284,7 @@ fn urlEncode(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
 
 var config = struct {
     arg1: []const u8 = undefined,
+    arg2: []const u8 = undefined,
 }{};
 
 pub fn main() !void {
@@ -349,6 +347,29 @@ pub fn main() !void {
                                             .{
                                                 .name = "torrent-file",
                                                 .value_ref = r.mkRef(&config.arg1),
+                                            },
+                                        },
+                                    ),
+                                },
+                            },
+                        },
+                    },
+                    cli.Command{
+                        .name = "handshake",
+                        .target = cli.CommandTarget{
+                            .action = cli.CommandAction{
+                                .exec = peerHandshake,
+                                .positional_args = cli.PositionalArgs{
+                                    .required = try r.mkSlice(
+                                        cli.PositionalArg,
+                                        &.{
+                                            .{
+                                                .name = "torrent-file",
+                                                .value_ref = r.mkRef(&config.arg1),
+                                            },
+                                            .{
+                                                .name = "peer",
+                                                .value_ref = r.mkRef(&config.arg2),
                                             },
                                         },
                                     ),
@@ -450,7 +471,35 @@ fn printPeers() !void {
     defer allocator.free(peers);
 
     for (peers) |peer| {
-        try peer.write(writer);
-        try writer.writeByte('\n');
+        try writer.print("{d}.{d}.{d}.{d}:{d}\n", .{ peer.ip[0], peer.ip[1], peer.ip[2], peer.ip[3], peer.port });
     }
+}
+
+fn peerHandshake() !void {
+    const writer = std.io.getStdOut().writer();
+
+    const torrent_info = try parseTorrentFile(allocator, config.arg1);
+    defer torrent_info.deinit(allocator);
+
+    var iter = std.mem.split(u8, config.arg2, ":");
+    const peer_ip = iter.first();
+    const peer_port = try std.fmt.parseInt(u16, iter.next() orelse return error.InvalidPeer, 10);
+
+    const peer = try std.net.Address.parseIp4(peer_ip, peer_port);
+    const stream = try std.net.tcpConnectToAddress(peer);
+    defer stream.close();
+
+    var peer_id: [20]u8 = undefined;
+    std.crypto.random.bytes(&peer_id);
+
+    const data = [_]u8{19} ++ "BitTorrent protocol" ++ [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 } ++ torrent_info.info_hash ++ peer_id;
+    var stream_writer = stream.writer();
+    _ = try stream_writer.write(data);
+
+    var stream_reader = stream.reader();
+
+    var response: [68]u8 = undefined;
+    _ = try stream_reader.readAll(&response);
+
+    try writer.print("Peer ID: {s}\n", .{std.fmt.fmtSliceHexLower(response[48..])});
 }
