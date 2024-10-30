@@ -604,7 +604,7 @@ fn downloadPiece() !void {
     const torrent_file = try parseTorrentFile(allocator, config.arg1);
     defer torrent_file.deinit(allocator);
 
-    const output_file = try std.fs.cwd().createFile(config.arg3, .{});
+    const output_file = try std.fs.cwd().createFile(config.arg3, .{ .read = true });
     defer output_file.close();
 
     const output_file_writer = output_file.writer();
@@ -635,6 +635,8 @@ fn downloadPiece() !void {
     var piece_index_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &piece_index_bytes, piece_index, .big);
 
+    var hasher = Sha1.init(.{});
+
     while (piece_length > 0) {
         const block_length: u32 = @intCast(@min(piece_length, 16 * 1024));
 
@@ -650,9 +652,17 @@ fn downloadPiece() !void {
         const block = try peer.waitFor(allocator, .Piece);
         defer allocator.free(block);
 
+        hasher.update(block[9..]);
         try output_file_writer.writeAll(block[9..]);
 
         begin += block_length;
         piece_length -= block_length;
     }
+
+    const expected_piece_hash = torrent_file.pieces[piece_index];
+
+    var piece_hash: [Sha1.digest_length]u8 = undefined;
+    hasher.final(&piece_hash);
+
+    if (!std.mem.eql(u8, &piece_hash, expected_piece_hash)) return error.PieceHashMismatch;
 }
