@@ -258,7 +258,7 @@ const Peer = struct {
             const message = try alloc.alloc(u8, message_len);
 
             _ = try stream_reader.readAll(message);
-            if (message[0] == @intFromEnum(message_type)) return message;
+            if (message.len > 0 and message[0] == @intFromEnum(message_type)) return message;
 
             alloc.free(message);
         }
@@ -276,6 +276,61 @@ const Peer = struct {
         _ = try stream_writer.write(&buffer);
         try stream_writer.writeByte(@intFromEnum(message_type));
         _ = try stream_writer.write(payload);
+    }
+
+    fn waitForReadyState(self: *Peer, alloc: std.mem.Allocator) !void {
+        const bitfield_message = try self.waitFor(alloc, .Bitfield);
+        defer alloc.free(bitfield_message);
+
+        try self.send(.Interested, &.{});
+
+        const unchoke_message = try self.waitFor(alloc, .Unchoke);
+        defer alloc.free(unchoke_message);
+    }
+
+    fn downloadPiece(self: *Peer, alloc: std.mem.Allocator, torrent_file: TorrentInfo, piece_index: u32, writer: anytype) !void {
+        var piece_length = if (piece_index == torrent_file.pieces.len - 1 and @mod(torrent_file.length, torrent_file.piece_length) != 0) @mod(torrent_file.length, torrent_file.piece_length) else torrent_file.piece_length;
+        var begin: u32 = 0;
+
+        var piece_index_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &piece_index_bytes, piece_index, .big);
+
+        var hasher = Sha1.init(.{});
+
+        while (piece_length > 0) {
+            const block_length: u32 = @intCast(@min(piece_length, 16 * 1024));
+
+            var begin_bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &begin_bytes, begin, .big);
+
+            var block_length_bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &block_length_bytes, block_length, .big);
+
+            const payload = piece_index_bytes ++ begin_bytes ++ block_length_bytes;
+            try self.send(.Request, &payload);
+
+            const block = try self.waitFor(alloc, .Piece);
+            defer alloc.free(block);
+
+            hasher.update(block[9..]);
+            try writer.writeAll(block[9..]);
+
+            begin += block_length;
+            piece_length -= block_length;
+        }
+
+        const expected_piece_hash = torrent_file.pieces[piece_index];
+
+        var piece_hash: [Sha1.digest_length]u8 = undefined;
+        hasher.final(&piece_hash);
+
+        if (!std.mem.eql(u8, &piece_hash, expected_piece_hash)) return error.PieceHashMismatch;
+    }
+
+    fn download(self: *Peer, alloc: std.mem.Allocator, torrent_file: TorrentInfo, writer: anytype) !void {
+        for (0..torrent_file.pieces.len) |piece_index| {
+            try self.downloadPiece(alloc, torrent_file, @intCast(piece_index), writer);
+        }
     }
 };
 
@@ -418,114 +473,148 @@ pub fn main() !void {
         .command = cli.Command{
             .name = "bittorrent-client",
             .target = cli.CommandTarget{
-                .subcommands = &.{ cli.Command{
-                    .name = "decode",
-                    .target = cli.CommandTarget{
-                        .action = cli.CommandAction{
-                            .exec = decodeBencode,
-                            .positional_args = cli.PositionalArgs{
-                                .required = try r.mkSlice(
-                                    cli.PositionalArg,
-                                    &.{
-                                        .{
-                                            .name = "bencode-string",
-                                            .value_ref = r.mkRef(&config.arg1),
+                .subcommands = &.{
+                    cli.Command{
+                        .name = "decode",
+                        .target = cli.CommandTarget{
+                            .action = cli.CommandAction{
+                                .exec = decodeBencode,
+                                .positional_args = cli.PositionalArgs{
+                                    .required = try r.mkSlice(
+                                        cli.PositionalArg,
+                                        &.{
+                                            .{
+                                                .name = "bencode-string",
+                                                .value_ref = r.mkRef(&config.arg1),
+                                            },
                                         },
-                                    },
-                                ),
+                                    ),
+                                },
                             },
                         },
                     },
-                }, cli.Command{
-                    .name = "info",
-                    .target = cli.CommandTarget{
-                        .action = cli.CommandAction{
-                            .exec = printInfo,
-                            .positional_args = cli.PositionalArgs{
-                                .required = try r.mkSlice(
-                                    cli.PositionalArg,
-                                    &.{
-                                        .{
-                                            .name = "torrent-file",
-                                            .value_ref = r.mkRef(&config.arg1),
+                    cli.Command{
+                        .name = "info",
+                        .target = cli.CommandTarget{
+                            .action = cli.CommandAction{
+                                .exec = printInfo,
+                                .positional_args = cli.PositionalArgs{
+                                    .required = try r.mkSlice(
+                                        cli.PositionalArg,
+                                        &.{
+                                            .{
+                                                .name = "torrent-file",
+                                                .value_ref = r.mkRef(&config.arg1),
+                                            },
                                         },
-                                    },
-                                ),
+                                    ),
+                                },
                             },
                         },
                     },
-                }, cli.Command{
-                    .name = "peers",
-                    .target = cli.CommandTarget{
-                        .action = cli.CommandAction{
-                            .exec = printPeers,
-                            .positional_args = cli.PositionalArgs{
-                                .required = try r.mkSlice(
-                                    cli.PositionalArg,
-                                    &.{
-                                        .{
-                                            .name = "torrent-file",
-                                            .value_ref = r.mkRef(&config.arg1),
+                    cli.Command{
+                        .name = "peers",
+                        .target = cli.CommandTarget{
+                            .action = cli.CommandAction{
+                                .exec = printPeers,
+                                .positional_args = cli.PositionalArgs{
+                                    .required = try r.mkSlice(
+                                        cli.PositionalArg,
+                                        &.{
+                                            .{
+                                                .name = "torrent-file",
+                                                .value_ref = r.mkRef(&config.arg1),
+                                            },
                                         },
-                                    },
-                                ),
+                                    ),
+                                },
                             },
                         },
                     },
-                }, cli.Command{
-                    .name = "handshake",
-                    .target = cli.CommandTarget{
-                        .action = cli.CommandAction{
-                            .exec = peerHandshake,
-                            .positional_args = cli.PositionalArgs{
-                                .required = try r.mkSlice(
-                                    cli.PositionalArg,
-                                    &.{
-                                        .{
-                                            .name = "torrent-file",
-                                            .value_ref = r.mkRef(&config.arg1),
+                    cli.Command{
+                        .name = "handshake",
+                        .target = cli.CommandTarget{
+                            .action = cli.CommandAction{
+                                .exec = peerHandshake,
+                                .positional_args = cli.PositionalArgs{
+                                    .required = try r.mkSlice(
+                                        cli.PositionalArg,
+                                        &.{
+                                            .{
+                                                .name = "torrent-file",
+                                                .value_ref = r.mkRef(&config.arg1),
+                                            },
+                                            .{
+                                                .name = "peer",
+                                                .value_ref = r.mkRef(&config.arg2),
+                                            },
                                         },
-                                        .{
-                                            .name = "peer",
-                                            .value_ref = r.mkRef(&config.arg2),
-                                        },
-                                    },
-                                ),
+                                    ),
+                                },
                             },
                         },
                     },
-                }, cli.Command{
-                    .name = "download_piece",
-                    .options = &.{
-                        .{
-                            .long_name = "output-file",
-                            .short_alias = 'o',
-                            .help = "Output file",
-                            .required = true,
-                            .value_ref = r.mkRef(&config.arg3),
+                    cli.Command{
+                        .name = "download_piece",
+                        .options = &.{
+                            .{
+                                .long_name = "output-file",
+                                .short_alias = 'o',
+                                .help = "Output file",
+                                .required = true,
+                                .value_ref = r.mkRef(&config.arg3),
+                            },
                         },
-                    },
-                    .target = cli.CommandTarget{
-                        .action = cli.CommandAction{
-                            .exec = downloadPiece,
-                            .positional_args = cli.PositionalArgs{
-                                .required = try r.mkSlice(
-                                    cli.PositionalArg,
-                                    &.{
-                                        .{
-                                            .name = "torrent-file",
-                                            .value_ref = r.mkRef(&config.arg1),
+                        .target = cli.CommandTarget{
+                            .action = cli.CommandAction{
+                                .exec = downloadPiece,
+                                .positional_args = cli.PositionalArgs{
+                                    .required = try r.mkSlice(
+                                        cli.PositionalArg,
+                                        &.{
+                                            .{
+                                                .name = "torrent-file",
+                                                .value_ref = r.mkRef(&config.arg1),
+                                            },
+                                            .{
+                                                .name = "piece-index",
+                                                .value_ref = r.mkRef(&config.arg2),
+                                            },
                                         },
-                                        .{
-                                            .name = "piece-index",
-                                            .value_ref = r.mkRef(&config.arg2),
-                                        },
-                                    },
-                                ),
+                                    ),
+                                },
                             },
                         },
                     },
-                } },
+                    cli.Command{
+                        .name = "download",
+                        .options = &.{
+                            .{
+                                .long_name = "output-file",
+                                .short_alias = 'o',
+                                .help = "Output file",
+                                .required = true,
+                                .value_ref = r.mkRef(&config.arg3),
+                            },
+                        },
+                        .target = cli.CommandTarget{
+                            .action = cli.CommandAction{
+                                .exec = download,
+                                .positional_args = cli.PositionalArgs{
+                                    .required = try r.mkSlice(
+                                        cli.PositionalArg,
+                                        &.{
+                                            .{
+                                                .name = "torrent-file",
+                                                .value_ref = r.mkRef(&config.arg1),
+                                            },
+                                        },
+                                    ),
+                                },
+                            },
+                        },
+                    },
+                },
             },
         },
     };
@@ -604,11 +693,10 @@ fn downloadPiece() !void {
     const torrent_file = try parseTorrentFile(allocator, config.arg1);
     defer torrent_file.deinit(allocator);
 
-    const output_file = try std.fs.cwd().createFile(config.arg3, .{ .read = true });
+    const output_file = try std.fs.cwd().createFile(config.arg3, .{});
     defer output_file.close();
 
     const output_file_writer = output_file.writer();
-
     const piece_index = try std.fmt.parseInt(u32, config.arg2, 10);
 
     const peers = try discoverPeers(allocator, torrent_file);
@@ -617,52 +705,35 @@ fn downloadPiece() !void {
         allocator.free(peers);
     }
 
-    var peer = peers[1];
+    const peer_index = std.crypto.random.intRangeAtMost(usize, 0, peers.len - 1);
+    var peer = peers[peer_index];
     _ = try peer.hanshake(torrent_file);
 
-    const bitfield_message = try peer.waitFor(allocator, .Bitfield);
-    defer allocator.free(bitfield_message);
+    try peer.waitForReadyState(allocator);
 
-    try peer.send(.Interested, &.{});
+    try peer.downloadPiece(allocator, torrent_file, piece_index, output_file_writer);
+}
 
-    const unchoke_message = try peer.waitFor(allocator, .Unchoke);
-    defer allocator.free(unchoke_message);
+fn download() !void {
+    const torrent_file = try parseTorrentFile(allocator, config.arg1);
+    defer torrent_file.deinit(allocator);
 
-    // TODO: consider that for the last piece, we may have a different length
-    var piece_length = torrent_file.piece_length;
-    var begin: u32 = 0;
+    const output_file = try std.fs.cwd().createFile(config.arg3, .{});
+    defer output_file.close();
 
-    var piece_index_bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &piece_index_bytes, piece_index, .big);
+    const output_file_writer = output_file.writer();
 
-    var hasher = Sha1.init(.{});
-
-    while (piece_length > 0) {
-        const block_length: u32 = @intCast(@min(piece_length, 16 * 1024));
-
-        var begin_bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &begin_bytes, begin, .big);
-
-        var block_length_bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &block_length_bytes, block_length, .big);
-
-        const payload = piece_index_bytes ++ begin_bytes ++ block_length_bytes;
-        try peer.send(.Request, &payload);
-
-        const block = try peer.waitFor(allocator, .Piece);
-        defer allocator.free(block);
-
-        hasher.update(block[9..]);
-        try output_file_writer.writeAll(block[9..]);
-
-        begin += block_length;
-        piece_length -= block_length;
+    const peers = try discoverPeers(allocator, torrent_file);
+    defer {
+        for (peers) |peer| peer.deinit(allocator);
+        allocator.free(peers);
     }
 
-    const expected_piece_hash = torrent_file.pieces[piece_index];
+    const peer_index = std.crypto.random.intRangeAtMost(usize, 0, peers.len - 1);
+    var peer = peers[peer_index];
+    _ = try peer.hanshake(torrent_file);
 
-    var piece_hash: [Sha1.digest_length]u8 = undefined;
-    hasher.final(&piece_hash);
+    try peer.waitForReadyState(allocator);
 
-    if (!std.mem.eql(u8, &piece_hash, expected_piece_hash)) return error.PieceHashMismatch;
+    try peer.download(allocator, torrent_file, output_file_writer);
 }
